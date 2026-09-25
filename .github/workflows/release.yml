@@ -145,6 +145,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The publish step looks back through history for a commit to tag.
+          fetch-depth: 0
 
       - name: Prepare paths
         run: |
@@ -214,8 +217,26 @@ jobs:
             echo "SHA-256: $(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256")"
             echo "Size: $(stat -c %s "$CHR_BUILD_ROOT/out/$ASSET") bytes"
             echo
-            echo "Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID from commit $GITHUB_SHA"
           } > "$RUNNER_TEMP/release-notes.md"
+          # GITHUB_TOKEN may not create a tag on a commit that itself changes
+          # .github/workflows: that needs the workflows permission, which the
+          # token can never have, and GitHub answers 403.  Tag the newest
+          # commit whose own changes leave the workflows alone; the notes above
+          # name the commit the image was really built from.
+          TARGET=""
+          for commit in $(git rev-list HEAD); do
+            if git rev-parse -q --verify "$commit^" >/dev/null \
+              && git diff --quiet "$commit^" "$commit" -- .github/workflows; then
+              TARGET=$commit
+              break
+            fi
+          done
+          if [ -z "$TARGET" ]; then
+            echo "::error::every commit changes .github/workflows; push a commit that does not, then rerun"
+            exit 1
+          fi
+          echo "tagging $TARGET"
           # A forced rebuild reaches this point only after the new image has
           # passed every check; only then does the old release and its tag go.
           if [ "$REPLACE" = true ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -229,7 +250,7 @@ jobs:
           gh release create "$TAG" \
             "$CHR_BUILD_ROOT/out/$ASSET" "$CHR_BUILD_ROOT/out/$ASSET.sha256" \
             -R "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target "$TARGET" \
             --title "CHR $LABEL — containers enabled" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --latest="$LATEST"
