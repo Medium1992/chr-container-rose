@@ -46,6 +46,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
@@ -98,6 +99,39 @@ def image_tool(command, *paths):
     return result.stdout.strip()
 
 
+def zip_is_intact(path):
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.testzip() is None
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def download(url, target, attempts=6):
+    """Fetch one file from download.mikrotik.com, resuming after drops.
+
+    The mirror is slow for CI runners and regularly resets connections in
+    the middle of a transfer (curl exit 56).  Each attempt resumes where the
+    previous one stopped, a stalled transfer counts as a drop, and only an
+    archive that passes its CRC check counts as downloaded.
+    """
+    for attempt in range(1, attempts + 1):
+        if target.exists() and zip_is_intact(target):
+            return
+        resume = ["-C", "-"] if target.exists() else []
+        result = subprocess.run(["curl", "-fsSL", "--retry", "3", "--connect-timeout", "30",
+                                 "--speed-limit", "10240", "--speed-time", "60",
+                                 *resume, "-o", str(target), url])
+        if result.returncode == 0 and zip_is_intact(target):
+            return
+        if result.returncode == 0:
+            # Complete but corrupt: resuming would only keep the damage.
+            target.unlink(missing_ok=True)
+        log(f"download of {target.name} failed (attempt {attempt}/{attempts}, curl exit {result.returncode})")
+        time.sleep(15 * attempt)
+    raise RuntimeError(f"could not download {url}")
+
+
 def prepare():
     """Download the stock image and the two packages if they are missing."""
     if STOCK.exists() and all((PKG_DIR / p).exists() for p in PACKAGES):
@@ -109,9 +143,7 @@ def prepare():
     image_zip = downloads / f"chr-{VERSION}.img.zip"
     packages_zip = downloads / f"all_packages-x86-{VERSION}.zip"
     for target in (image_zip, packages_zip):
-        if not target.exists():
-            subprocess.run(["curl", "-sfL", "--retry", "3", "-o", str(target), f"{base}/{target.name}"],
-                           check=True)
+        download(f"{base}/{target.name}", target)
     if WINDOWS:
         subprocess.run([SEVEN_ZIP, "e", str(image_zip), f"-o{WORK}", "-y"], check=True, capture_output=True)
         subprocess.run([SEVEN_ZIP, "e", str(packages_zip), f"-o{PKG_DIR}", *PACKAGES, "-y"],
