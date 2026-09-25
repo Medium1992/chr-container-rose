@@ -1,0 +1,39 @@
+# One-shot build script, run by RouterOS on the first boot of the stock image.
+# Progress is reported as HTTP requests to the build host instead of files, so
+# nothing is left behind in the finished image.  The stock CHR already runs a
+# DHCP client on ether1; only wait for it to bind.
+# A freshly bound DHCP lease sometimes drops the first request; retry markers.
+:local mark do={
+    :local sent false
+    :for i from=1 to=10 do={
+        :if (!$sent) do={
+            :do {
+                /tool/fetch url=("http://10.0.2.2:{PORT}/marker/" . $1) output=none
+                :set sent true
+            } on-error={ :delay 1s }
+        }
+    }
+}
+:local t 0
+:while (([:len [/ip/dhcp-client/find where status="bound"]] = 0) && ($t < 120)) do={
+    :delay 1s
+    :set t ($t + 1)
+}
+$mark "stage1-started"
+:foreach pkg in={PACKAGES} do={
+    :onerror e in={
+        /tool/fetch url=("http://10.0.2.2:{PORT}/" . $pkg) dst-path=$pkg
+    } do={
+        $mark ("error-fetch-" . $pkg)
+    }
+}
+# The second half runs after a clean reboot: packages are only installed at
+# boot, and a hard power cut straight after the download loses the files.
+# It was injected next to this script as rw/disk/build-stage2.rsc.
+:onerror e in={
+    /system/scheduler/add name=build-stage2 start-time=startup on-event="/import file-name=build-stage2.rsc"
+} do={
+    $mark "error-stage2-setup"
+}
+$mark "rebooting"
+/system/reboot

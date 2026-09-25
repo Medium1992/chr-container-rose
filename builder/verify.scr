@@ -1,0 +1,12 @@
+:delay 20s
+/system package print without-paging file=verify-packages
+/system device-mode print file=verify-device-mode
+/interface print without-paging file=verify-interfaces
+/system license print file=verify-license
+/user print without-paging file=verify-users
+/system scheduler print without-paging file=verify-scheduler
+/ip address print without-paging file=verify-addresses
+/ip dhcp-client print without-paging file=verify-dhcp
+/export file=verify-export
+:delay 5s
+/system shutdown

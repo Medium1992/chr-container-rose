@@ -1,0 +1,8 @@
+# Build workspace: downloads, working images and verification dumps.
+work/
+*.img
+*.img.zip
+
+# Python bytecode
+__pycache__/
+*.py[cod]

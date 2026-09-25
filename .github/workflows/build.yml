@@ -1,0 +1,138 @@
+name: Build CHR image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: RouterOS version, e.g. 7.24.4
+        required: true
+        type: string
+      publish:
+        description: Publish the image as a GitHub release
+        type: boolean
+        default: true
+      latest:
+        description: Mark the release as Latest
+        type: boolean
+        default: false
+      long_term:
+        description: Label the release as the long-term branch
+        type: boolean
+        default: false
+      accel:
+        description: QEMU acceleration (tcg is the slow fallback)
+        type: choice
+        options: [kvm, tcg]
+        default: kvm
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-chr-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Inputs reach the shell only through the environment, never through
+      # template substitution inside a script.
+      VERSION: ${{ inputs.version }}
+      PUBLISH: ${{ inputs.publish }}
+      LATEST: ${{ inputs.latest }}
+      LONG_TERM: ${{ inputs.long_term }}
+      CHR_ACCEL: ${{ inputs.accel }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate the request
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?([a-z]+[0-9]+)?$ ]]; then
+            echo "::error::not a RouterOS version: $VERSION"
+            exit 1
+          fi
+          echo "TAG=chr-$VERSION-container-rose-advanced" >> "$GITHUB_ENV"
+          echo "ASSET=chr-$VERSION-container-rose.img" >> "$GITHUB_ENV"
+          echo "CHR_BUILD_ROOT=$RUNNER_TEMP/chr" >> "$GITHUB_ENV"
+
+      - name: Refuse to overwrite an existing release
+        if: inputs.publish
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; delete it first to rebuild"
+            exit 1
+          fi
+
+      - name: Enable KVM
+        if: inputs.accel == 'kvm'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 unzip fdisk
+
+      - name: Build and verify the image
+        run: python3 builder/build.py "$VERSION"
+
+      - name: Write the job summary
+        if: always()
+        run: |
+          {
+            echo "## CHR $VERSION"
+            if [ -f "$CHR_BUILD_ROOT/out/$ASSET.sha256" ]; then
+              echo "SHA-256: \`$(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256")\`"
+              echo
+            fi
+            if [ -f "$CHR_BUILD_ROOT/$VERSION/summary.md" ]; then
+              cat "$CHR_BUILD_ROOT/$VERSION/summary.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chr-${{ inputs.version }}-logs
+          path: |
+            ${{ runner.temp }}/chr/${{ inputs.version }}/*.log
+            ${{ runner.temp }}/chr/${{ inputs.version }}/summary.md
+            ${{ runner.temp }}/chr/${{ inputs.version }}/verify/
+            ${{ runner.temp }}/chr/${{ inputs.version }}/final-state/
+          if-no-files-found: ignore
+
+      - name: Upload the image as an artifact
+        if: success() && !inputs.publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: chr-${{ inputs.version }}-image
+          path: ${{ runner.temp }}/chr/out/
+
+      - name: Publish the release
+        if: success() && inputs.publish
+        run: |
+          label="$VERSION"
+          if [ "$LONG_TERM" = "true" ]; then label="$VERSION (long-term)"; fi
+          digest=$(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256")
+          size=$(stat -c %s "$CHR_BUILD_ROOT/out/$ASSET")
+          notes="Prebuilt RouterOS CHR $label image with container and rose-storage packages installed; device-mode advanced with container=yes and traffic-gen=yes.
+
+          SHA-256: $digest
+          Size: $size bytes
+
+          Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh release create "$TAG" \
+            "$CHR_BUILD_ROOT/out/$ASSET" "$CHR_BUILD_ROOT/out/$ASSET.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "CHR $label — containers enabled" \
+            --notes "$notes" \
+            --latest="$LATEST"
