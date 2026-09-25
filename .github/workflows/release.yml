@@ -5,6 +5,15 @@ on:
     - cron: "0 4 * * *" # 04:00 UTC
   workflow_dispatch:
     inputs:
+      channel:
+        description: Channels to check
+        type: choice
+        options: [both, stable, long-term]
+        default: both
+      force:
+        description: Rebuild and replace releases that already exist
+        type: boolean
+        default: false
       publish:
         description: Publish releases (off = dry run, images stay as run artifacts)
         type: boolean
@@ -34,6 +43,9 @@ jobs:
       matrix: ${{ steps.compare.outputs.matrix }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A scheduled run has no inputs: both channels, no forced rebuild.
+      CHANNEL: ${{ inputs.channel || 'both' }}
+      FORCE: ${{ inputs.force || false }}
 
     steps:
       - name: Compare MikroTik channels with published releases
@@ -57,19 +69,36 @@ jobs:
           echo "MikroTik stable: $STABLE, long-term: $LTS"
 
           entries=()
-          want() { # <version> <latest> <label>
-            if gh release view "chr-$1-container-rose-advanced" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "$3: already released"
-            else
-              echo "$3: build needed"
-              entries+=("$(jq -cn --arg version "$1" --argjson latest "$2" --arg label "$3" \
-                '{version: $version, latest: $latest, label: $label}')")
+          rows=()
+          want() { # <channel> <version> <latest> <label>
+            if [ "$CHANNEL" != both ] && [ "$CHANNEL" != "$1" ]; then
+              rows+=("| $1 | $2 | не выбран |")
+              return
             fi
+            replace=false
+            if gh release view "chr-$2-container-rose-advanced" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              if [ "$FORCE" != true ]; then
+                echo "$4: already released"
+                rows+=("| $1 | $2 | уже опубликована |")
+                return
+              fi
+              # The old release is replaced only after the rebuild has passed
+              # every check, so a failed rebuild never leaves the channel empty.
+              replace=true
+              echo "$4: forced rebuild"
+              rows+=("| $1 | $2 | будет пересобрана |")
+            else
+              echo "$4: build needed"
+              rows+=("| $1 | $2 | будет собрана |")
+            fi
+            entries+=("$(jq -cn --arg version "$2" --argjson latest "$3" --arg label "$4" \
+              --argjson replace "$replace" \
+              '{version: $version, latest: $latest, label: $label, replace: $replace}')")
           }
-          want "$STABLE" true "$STABLE"
+          want stable "$STABLE" true "$STABLE"
           # Should long-term ever catch up with stable, one release covers both.
           if [ "$LTS" != "$STABLE" ]; then
-            want "$LTS" false "$LTS (long-term)"
+            want long-term "$LTS" false "$LTS (long-term)"
           fi
 
           MATRIX=$(printf '%s\n' "${entries[@]}" | jq -cs '{include: .}')
@@ -82,14 +111,7 @@ jobs:
           {
             echo "| Канал | Версия | Статус |"
             echo "| --- | --- | --- |"
-            for pair in "stable $STABLE" "long-term $LTS"; do
-              set -- $pair
-              if printf '%s\n' "${entries[@]}" | grep -q "\"version\":\"$2\""; then
-                echo "| $1 | $2 | будет собрана |"
-              else
-                echo "| $1 | $2 | уже опубликована |"
-              fi
-            done
+            printf '%s\n' "${rows[@]}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # GitHub switches off schedules in a public repository after 60 days
@@ -184,6 +206,7 @@ jobs:
         if: success() && env.PUBLISH == 'true'
         env:
           LATEST: ${{ matrix.latest }}
+          REPLACE: ${{ matrix.replace }}
         run: |
           {
             echo "Prebuilt RouterOS CHR $LABEL image with container and rose-storage packages installed; device-mode advanced with container=yes and traffic-gen=yes."
@@ -193,6 +216,12 @@ jobs:
             echo
             echo "Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } > "$RUNNER_TEMP/release-notes.md"
+          # A forced rebuild reaches this point only after the new image has
+          # passed every check; only then does the old release and its tag go.
+          if [ "$REPLACE" = true ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
+            echo "replaced the previous $TAG release"
+          fi
           # gh refuses to create a release whose tag already has one, so a
           # parallel run can never extend or overwrite a published image.
           # --latest=false keeps a long-term release from taking Latest away
