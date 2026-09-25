@@ -1,0 +1,205 @@
+name: Build and Publish
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish releases (off = dry run, images stay as run artifacts)
+        type: boolean
+        default: true
+      accel:
+        description: QEMU acceleration (tcg is the slow fallback)
+        type: choice
+        options: [kvm, tcg]
+        default: kvm
+
+permissions:
+  contents: read
+
+# Two runs must never race to publish the same release.
+concurrency:
+  group: chr-release
+  cancel-in-progress: false
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      build_needed: ${{ steps.compare.outputs.build_needed }}
+      matrix: ${{ steps.compare.outputs.matrix }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Compare MikroTik channels with published releases
+        id: compare
+        run: |
+          set -euo pipefail
+          # RouterOS itself learns about updates from these files: the first
+          # field is the version, the second the release timestamp.
+          channel() {
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+              "https://upgrade.mikrotik.com/routeros/NEWESTa7.$1" | awk '{print $1}'
+          }
+          STABLE=$(channel stable)
+          LTS=$(channel long-term)
+          for v in "$STABLE" "$LTS"; do
+            if [[ ! "$v" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::unexpected version from upgrade.mikrotik.com: '$v'"
+              exit 1
+            fi
+          done
+          echo "MikroTik stable: $STABLE, long-term: $LTS"
+
+          entries=()
+          want() { # <version> <latest> <label>
+            if gh release view "chr-$1-container-rose-advanced" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$3: already released"
+            else
+              echo "$3: build needed"
+              entries+=("$(jq -cn --arg version "$1" --argjson latest "$2" --arg label "$3" \
+                '{version: $version, latest: $latest, label: $label}')")
+            fi
+          }
+          want "$STABLE" true "$STABLE"
+          # Should long-term ever catch up with stable, one release covers both.
+          if [ "$LTS" != "$STABLE" ]; then
+            want "$LTS" false "$LTS (long-term)"
+          fi
+
+          MATRIX=$(printf '%s\n' "${entries[@]}" | jq -cs '{include: .}')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          if [ "${#entries[@]}" -gt 0 ]; then
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "| Канал | Версия | Статус |"
+            echo "| --- | --- | --- |"
+            for pair in "stable $STABLE" "long-term $LTS"; do
+              set -- $pair
+              if printf '%s\n' "${entries[@]}" | grep -q "\"version\":\"$2\""; then
+                echo "| $1 | $2 | будет собрана |"
+              else
+                echo "| $1 | $2 | уже опубликована |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # GitHub switches off schedules in a public repository after 60 days
+      # without commits.  Re-enabling the workflow through the API resets
+      # that timer, so the daily check survives quiet months.
+      - name: Keep the daily schedule alive
+        if: github.event_name == 'schedule'
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/enable"
+
+  release-build:
+    needs: release-check
+    if: needs.release-check.outputs.build_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    strategy:
+      # Channels are independent: a broken long-term build must not stop the
+      # stable release, and the other way round.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.release-check.outputs.matrix) }}
+
+    env:
+      VERSION: ${{ matrix.version }}
+      LABEL: ${{ matrix.label }}
+      CHR_ACCEL: ${{ inputs.accel || 'kvm' }}
+      PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare paths
+        run: |
+          echo "TAG=chr-$VERSION-container-rose-advanced" >> "$GITHUB_ENV"
+          echo "ASSET=chr-$VERSION-container-rose.img" >> "$GITHUB_ENV"
+          echo "CHR_BUILD_ROOT=$RUNNER_TEMP/chr" >> "$GITHUB_ENV"
+
+      - name: Enable KVM
+        if: env.CHR_ACCEL == 'kvm'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 unzip fdisk
+
+      - name: Build and verify the image
+        run: python3 builder/build.py "$VERSION"
+
+      - name: Write the job summary
+        if: always()
+        run: |
+          {
+            echo "## CHR $LABEL"
+            if [ -f "$CHR_BUILD_ROOT/out/$ASSET.sha256" ]; then
+              echo "SHA-256: \`$(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256")\`"
+              echo
+            fi
+            if [ -f "$CHR_BUILD_ROOT/$VERSION/summary.md" ]; then
+              cat "$CHR_BUILD_ROOT/$VERSION/summary.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chr-${{ matrix.version }}-logs
+          path: |
+            ${{ runner.temp }}/chr/${{ matrix.version }}/*.log
+            ${{ runner.temp }}/chr/${{ matrix.version }}/summary.md
+            ${{ runner.temp }}/chr/${{ matrix.version }}/verify/
+            ${{ runner.temp }}/chr/${{ matrix.version }}/final-state/
+          if-no-files-found: ignore
+
+      - name: Upload the image as an artifact
+        if: success() && env.PUBLISH != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: chr-${{ matrix.version }}-image
+          path: ${{ runner.temp }}/chr/out/
+
+      - name: Publish the release
+        if: success() && env.PUBLISH == 'true'
+        env:
+          LATEST: ${{ matrix.latest }}
+        run: |
+          {
+            echo "Prebuilt RouterOS CHR $LABEL image with container and rose-storage packages installed; device-mode advanced with container=yes and traffic-gen=yes."
+            echo
+            echo "SHA-256: $(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256")"
+            echo "Size: $(stat -c %s "$CHR_BUILD_ROOT/out/$ASSET") bytes"
+            echo
+            echo "Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$RUNNER_TEMP/release-notes.md"
+          # gh refuses to create a release whose tag already has one, so a
+          # parallel run can never extend or overwrite a published image.
+          # --latest=false keeps a long-term release from taking Latest away
+          # from stable, whichever of the two finishes last.
+          gh release create "$TAG" \
+            "$CHR_BUILD_ROOT/out/$ASSET" "$CHR_BUILD_ROOT/out/$ASSET.sha256" \
+            -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "CHR $LABEL — containers enabled" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --latest="$LATEST"
