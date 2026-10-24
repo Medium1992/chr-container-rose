@@ -23,17 +23,22 @@ any input, so the build steers RouterOS with scripts injected into the image.
   4. once a boot stays up, it is powered off through ACPI without logging
      in, and the stock (empty) rw/store/autorun.scr is put back;
   5. a throwaway copy boots with a verification autorun that dumps the state
-     into files, which are read back out of the image and checked.
+     into files, which are read back out of the image and checked;
+  6. a UEFI copy is made: the ext2 boot partition becomes FAT16 and the table
+     a GPT with a hybrid MBR.  Its partition 2 must match the BIOS image byte
+     for byte, and a throwaway copy must reach the login prompt under OVMF.
 
 The guest reports its progress as HTTP requests to the build host, so no
 marker files end up in the image.
 
-Linux (GitHub Actions): needs qemu-system-x86, unzip, sfdisk and sudo; KVM is
-used when /dev/kvm is accessible.  Windows: needs QEMU (see vm.py), 7-Zip and
-Docker Desktop, which provides the loop mounts; QEMU runs under TCG there.
+Linux (GitHub Actions): needs qemu-system-x86, ovmf, unzip, sfdisk, gdisk,
+dosfstools and sudo; KVM is used when /dev/kvm is accessible.  Windows: needs
+QEMU (see vm.py), 7-Zip and Docker Desktop, which provides the loop mounts;
+QEMU runs under TCG there.
 
 Usage:  python build.py <version>          e.g. python build.py 7.24.4
-Output: <CHR_BUILD_ROOT>/out/chr-<version>-container-rose.img and its .sha256
+Output: <CHR_BUILD_ROOT>/out/chr-<version>-container-rose.img (BIOS) and
+        chr-<version>-container-rose-uefi.img (UEFI), each with a .sha256
 """
 
 import functools
@@ -63,7 +68,9 @@ WORK = ROOT / VERSION
 OUT = ROOT / "out"
 STOCK = WORK / f"chr-{VERSION}.img"
 IMAGE = WORK / f"chr-{VERSION}-container-rose.img"
+UEFI_IMAGE = WORK / f"chr-{VERSION}-container-rose-uefi.img"
 VERIFY_COPY = WORK / "verify-copy.img"
+UEFI_COPY = WORK / "uefi-boot-copy.img"
 PKG_DIR = WORK / "pkg"
 PORT = 18081
 LOG = WORK / "build.log"
@@ -325,6 +332,71 @@ def check_results():
     log("verification passed")
 
 
+def mbr_partition(path, number):
+    """(start, size) in sectors of a primary partition, read from the MBR."""
+    with open(path, "rb") as fh:
+        entry = fh.read(512)[446 + 16 * (number - 1):446 + 16 * number]
+    return int.from_bytes(entry[8:12], "little"), int.from_bytes(entry[12:16], "little")
+
+
+def same_bytes(a, b, offset, length, chunk=1 << 20):
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        fa.seek(offset)
+        fb.seek(offset)
+        while length > 0:
+            n = min(chunk, length)
+            if fa.read(n) != fb.read(n):
+                return False
+            length -= n
+    return True
+
+
+def build_uefi():
+    log(image_tool("uefi", IMAGE, UEFI_IMAGE))
+    start, size = mbr_partition(IMAGE, 2)
+    partition2_kept = same_bytes(IMAGE, UEFI_IMAGE, start * 512, size * 512)
+
+    # The boot test runs on a copy: RouterOS writes to partition 2 on boot.
+    shutil.copyfile(UEFI_IMAGE, UEFI_COPY)
+    vars_copy = WORK / "uefi-vars.fd"
+    proc = vm.start(UEFI_COPY, nic=False, log=WORK / "qemu.log", extra=vm.uefi_args(vars_copy))
+    con = vm.Serial(transcript=WORK / "uefi-serial.log")
+    booted = False
+    try:
+        deadline = time.time() + 300
+        while time.time() < deadline and proc.poll() is None:
+            if "Login:" in con.drain(2):
+                booted = True
+                log("UEFI copy reached the login prompt under OVMF")
+                break
+    finally:
+        con.close()
+        if proc.poll() is None:
+            vm.monitor("quit")
+            vm.wait_exit(proc, 15)
+        UEFI_COPY.unlink(missing_ok=True)
+        vars_copy.unlink(missing_ok=True)
+
+    checks = {
+        "UEFI image: partition 2 identical to the BIOS image": partition2_kept,
+        "UEFI image boots to the login prompt under OVMF": booted,
+    }
+    with open(WORK / "summary.md", "a", encoding="utf-8", newline="\n") as fh:
+        fh.writelines(f"- {'✅' if ok else '❌'} {name}\n" for name, ok in checks.items())
+    for name, ok in checks.items():
+        log(f"[{'ok' if ok else 'FAIL'}] {name}")
+    failed = [name for name, ok in checks.items() if not ok]
+    if failed:
+        raise RuntimeError("UEFI verification failed: " + "; ".join(failed))
+
+
+def publish(image):
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    shutil.copyfile(image, OUT / image.name)
+    (OUT / f"{image.name}.sha256").write_text(f"{digest}  {image.name}\n", encoding="ascii", newline="\n")
+    log(f"done: {OUT / image.name} sha256={digest}")
+
+
 def main():
     WORK.mkdir(parents=True, exist_ok=True)
     for path in (LOG, TRANSCRIPT):
@@ -339,10 +411,10 @@ def main():
     log(f"image ready: {IMAGE.name} ({IMAGE.stat().st_size} bytes) sha256={digest}")
     verify()
     check_results()
+    build_uefi()
     OUT.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(IMAGE, OUT / IMAGE.name)
-    (OUT / f"{IMAGE.name}.sha256").write_text(f"{digest}  {IMAGE.name}\n", encoding="ascii", newline="\n")
-    log(f"done: {OUT / IMAGE.name}")
+    publish(IMAGE)
+    publish(UEFI_IMAGE)
 
 
 if __name__ == "__main__":

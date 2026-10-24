@@ -7,6 +7,7 @@ steers the guest through injected scripts instead.
 
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -39,6 +40,27 @@ def default_accel():
 
 ACCEL_NAME = os.environ.get("CHR_ACCEL") or default_accel()
 ACCEL = ACCEL_MODES[ACCEL_NAME]
+
+# OVMF (EDK II) for UEFI boots: the ovmf package on Ubuntu, the firmware
+# shipped with QEMU on Windows.  The code image is read-only; the variable
+# store is copied per boot.
+if os.name == "nt":
+    _FW = os.path.join(os.path.dirname(QEMU), "share")
+    DEFAULT_OVMF = (os.path.join(_FW, "edk2-x86_64-code.fd"), os.path.join(_FW, "edk2-i386-vars.fd"))
+else:
+    DEFAULT_OVMF = ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd")
+OVMF_CODE = os.environ.get("OVMF_CODE", DEFAULT_OVMF[0])
+OVMF_VARS = os.environ.get("OVMF_VARS", DEFAULT_OVMF[1])
+
+
+def uefi_args(vars_copy):
+    """QEMU arguments booting through OVMF with `vars_copy` as the NVRAM."""
+    shutil.copyfile(OVMF_VARS, vars_copy)
+    return [
+        "-machine", "q35",
+        "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
+        "-drive", f"if=pflash,format=raw,file={vars_copy}",
+    ]
 
 
 def start(image, nic=True, log=None, extra=()):

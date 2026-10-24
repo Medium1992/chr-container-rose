@@ -6,17 +6,26 @@
 #   img.sh inject  <image> <autorun> [<file for rw/disk>]
 #   img.sh collect <image> <outdir>
 #   img.sh scrub   <image> <stock image>
+#   img.sh uefi    <image> <uefi image>
 set -eu
 
-# The Alpine container used on Windows starts without sfdisk.
-if ! command -v sfdisk >/dev/null 2>&1 && command -v apk >/dev/null 2>&1; then
-  apk add -q --no-progress util-linux >/dev/null 2>&1
+# The Alpine container used on Windows starts without these tools.
+if ! command -v sgdisk >/dev/null 2>&1 && command -v apk >/dev/null 2>&1; then
+  apk add -q --no-progress util-linux gptfdisk dosfstools >/dev/null 2>&1
 fi
 
+# part_field <image> <partition number> <start|size>, in sectors.
+part_field() {
+  value=$(sfdisk -d "$1" | awk -F'[=,]' -v p="img$2" -v f="$3" '
+    index($0, p " ") || index($0, p ":") {
+      for (i = 1; i <= NF; i++) if ($i ~ f) { gsub(/ /, "", $(i+1)); print $(i+1); exit }
+    }')
+  [ -n "$value" ] || { echo "cannot find partition $2 in $1" >&2; exit 1; }
+  echo "$value"
+}
+
 part2_offset() {
-  start=$(sfdisk -d "$1" | awk -F'[=,]' '/img2 /||/img2:/{for(i=1;i<=NF;i++) if($i ~ /start/){gsub(/ /,"",$(i+1)); print $(i+1); exit}}')
-  [ -n "$start" ] || { echo "cannot find partition 2 in $1" >&2; exit 1; }
-  echo $((start * 512))
+  echo $(($(part_field "$1" 2 start) * 512))
 }
 
 cmd=$1
@@ -65,6 +74,39 @@ case "$cmd" in
     sync
     umount "$p2" "$stock"
     rmdir "$stock"
+    ;;
+  uefi)
+    # UEFI firmware reads only FAT, and the CHR boot partition (partition 1,
+    # holding EFI/BOOT/BOOTX64.EFI) is ext2.  The copy gets partition 1
+    # reformatted as FAT16 with the same files, and the table rebuilt as GPT
+    # with a hybrid MBR, partition 1 typed EF00.  Partition 2 is not touched.
+    # The new boot sector replaces the BIOS loader of partition 1, so the
+    # result boots under UEFI only.
+    cp "$image" "$3"
+    start=$(part_field "$3" 1 start)
+    size=$(part_field "$3" 1 size)
+    p1=$(mktemp -d)
+    files=$(mktemp -d)
+    loop=$(losetup -f --show -o $((start * 512)) --sizelimit $((size * 512)) "$3")
+    mount -o ro "$loop" "$p1"
+    cp -a "$p1/." "$files/"
+    rm -rf "$files/lost+found"
+    umount "$p1"
+    mkfs.vfat -F 16 -n ROUTEROS "$loop" >/dev/null
+    mount "$loop" "$p1"
+    cp -r "$files/." "$p1/"
+    sync
+    umount "$p1"
+    losetup -d "$loop"
+    rm -rf "$p1" "$files"
+    # The keystrokes of the "jaclaz" layout from tikoci/fat-chr: a fresh GPT
+    # from the MBR with the backup structures at the end, the legacy-bootable
+    # attribute on partition 1, EF00 "RouterOS Boot" and "RouterOS", then a
+    # hybrid MBR carrying both partitions as type 83 with partition 1 active.
+    printf '%s\n' 2 x e r f y x a 1 2 '' m t 1 EF00 c 1 'RouterOS Boot' c 2 RouterOS \
+      x r h '1 2' n 83 y 83 n n w y | gdisk "$3" >/dev/null
+    sgdisk -v "$3" | tail -n 1
+    echo "UEFI copy written to $(basename "$3")"
     ;;
   *)
     echo "unknown command $cmd" >&2
