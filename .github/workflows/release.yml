@@ -153,6 +153,7 @@ jobs:
         run: |
           echo "TAG=chr-$VERSION-container-rose-advanced" >> "$GITHUB_ENV"
           echo "ASSET=chr-$VERSION-container-rose.img" >> "$GITHUB_ENV"
+          echo "UEFI_ASSET=chr-$VERSION-container-rose-uefi.img" >> "$GITHUB_ENV"
           echo "CHR_BUILD_ROOT=$RUNNER_TEMP/chr" >> "$GITHUB_ENV"
 
       - name: Enable KVM
@@ -167,7 +168,7 @@ jobs:
       - name: Install QEMU
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 unzip fdisk
+          sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 ovmf unzip fdisk gdisk dosfstools
 
       - name: Build and verify the image
         run: python3 builder/build.py "$VERSION"
@@ -178,7 +179,11 @@ jobs:
           {
             echo "## CHR $LABEL"
             if [ -f "$CHR_BUILD_ROOT/out/$ASSET.sha256" ]; then
-              echo "SHA-256: \`$(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256")\`"
+              echo "SHA-256 (BIOS): \`$(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256")\`"
+              echo
+            fi
+            if [ -f "$CHR_BUILD_ROOT/out/$UEFI_ASSET.sha256" ]; then
+              echo "SHA-256 (UEFI): \`$(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$UEFI_ASSET.sha256")\`"
               echo
             fi
             if [ -f "$CHR_BUILD_ROOT/$VERSION/summary.md" ]; then
@@ -214,8 +219,10 @@ jobs:
           {
             echo "Prebuilt RouterOS CHR $LABEL image with container and rose-storage packages installed; device-mode advanced with container=yes and traffic-gen=yes."
             echo
-            echo "SHA-256: $(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256")"
-            echo "Size: $(stat -c %s "$CHR_BUILD_ROOT/out/$ASSET") bytes"
+            echo "- \`$ASSET\` — BIOS (stock CHR layout)."
+            echo "  SHA-256: $(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$ASSET.sha256"), size: $(stat -c %s "$CHR_BUILD_ROOT/out/$ASSET") bytes"
+            echo "- \`$UEFI_ASSET\` — UEFI: the same image with the boot partition in FAT16 and a GPT with a hybrid MBR; does not boot under BIOS."
+            echo "  SHA-256: $(cut -d' ' -f1 "$CHR_BUILD_ROOT/out/$UEFI_ASSET.sha256"), size: $(stat -c %s "$CHR_BUILD_ROOT/out/$UEFI_ASSET") bytes"
             echo
             echo "Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID from commit $GITHUB_SHA"
           } > "$RUNNER_TEMP/release-notes.md"
@@ -249,6 +256,7 @@ jobs:
           # from stable, whichever of the two finishes last.
           gh release create "$TAG" \
             "$CHR_BUILD_ROOT/out/$ASSET" "$CHR_BUILD_ROOT/out/$ASSET.sha256" \
+            "$CHR_BUILD_ROOT/out/$UEFI_ASSET" "$CHR_BUILD_ROOT/out/$UEFI_ASSET.sha256" \
             -R "$GITHUB_REPOSITORY" \
             --target "$TARGET" \
             --title "CHR $LABEL — containers enabled" \
